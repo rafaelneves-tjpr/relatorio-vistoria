@@ -618,6 +618,7 @@ const OBJETIVOS = [
   {t:"Fiscalização de serviços em execução", fin:"verificar o andamento e as condições dos serviços contratados"},
   {t:"Fiscalização de correções em serviços finalizados e sob garantia", fin:"verificar as correções de serviços finalizados e sob garantia"}
 ];
+const MOBILE = /Android|iPhone|iPad|iPod/i.test(navigator.userAgent) || (navigator.deviceMemory && navigator.deviceMemory<=4);
 const CFG_DEFAULT = {device:"auto", asr:"onnx-community/whisper-base", vision:"onnx-community/Florence-2-base-ft",
   llm:"onnx-community/Qwen2.5-0.5B-Instruct", useLlm:true, autoAsr:true, autoVis:true, imgH:165, geo:true, geoPdf:true};
 const TF_URL = "https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.8.1";
@@ -652,6 +653,13 @@ function esc(s){ return String(s??"").replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&l
 
 /* ====================== ESTADO ====================== */
 let CFG = Object.assign({}, CFG_DEFAULT, LS.get("cfg",{}));
+// Celular: memória limitada → sem LLM por padrão, CPU (WASM) quantizado e um modelo por vez
+if(MOBILE && !LS.get("mobileCfg2",false)){ CFG.useLlm=false; CFG.device="auto"; LS.set("cfg",CFG); LS.set("mobileCfg2",true); }
+// Proteção contra travamento: se a página fechou no meio de uma etapa da IA, desliga essa etapa automática neste aparelho
+const AI_CRASH = LS.get("aiBusy",null);
+if(AI_CRASH){ LS.del("aiBusy");
+  if(AI_CRASH==="vis"){ CFG.autoVis=false; } else if(AI_CRASH==="llm"){ CFG.useLlm=false; } else if(AI_CRASH==="asr"){ CFG.autoAsr=false; }
+  LS.set("cfg",CFG); }
 let REGMAP = Object.assign({}, REG_DEFAULT, LS.get("regmap",{}));
 const S = { photos:[], audios:[] };   // photo: {id,data,w,h,caption,visual,edited,busy}
 const FIELDS = ["comarca","unidade","endereco","regional","objetivo","sei","dataVist","dataRel","transcricao","descricao","observacoes"];
@@ -848,24 +856,64 @@ function transcribe(a){
       const pcm=await decodeAudio(a.blob);
       const asr=await getASR();
       a.status="Transcrevendo ("+Math.round(pcm.length/16000)+" s)…"; renderAudios(); setStatus("Transcrevendo áudio "+a.name+"…");
-      const out=await asr(pcm,{language:"portuguese",task:"transcribe",chunk_length_s:30,stride_length_s:5});
+      busy("asr"); const out=await asr(pcm,{language:"portuguese",task:"transcribe",chunk_length_s:30,stride_length_s:5}); idle();
       const txt=(Array.isArray(out)?out.map(o=>o.text).join(" "):out.text||"").trim();
       a.status=txt?"Transcrito ✓":"Sem fala detectada"; renderAudios(); hideStatus();
       if(txt){ const t=$("#transcricao"); t.value=(t.value.trim()?t.value.trim()+"\n\n":"")+txt; save(); onTranscriptChanged(); }
-    }catch(err){ console.error(err); a.status="Erro: "+(err.message||err); renderAudios(); hideStatus(); toast("Falha na transcrição: "+(err.message||err),6000); }
+    }catch(err){ idle(); console.error(err); a.status="Erro: "+(err.message||err); renderAudios(); hideStatus(); toast("Falha na transcrição: "+(err.message||err),6000); }
   });
 }
-// Ditado ao vivo (reconhecimento do navegador; normalmente requer internet)
-const SRec=window.SpeechRecognition||window.webkitSpeechRecognition; let dict=null;
+// Ditado ao vivo (reconhecimento do navegador; normalmente requer internet).
+// No Android o Chrome devolve cada trecho repetido e acumulado ("Verifiquei", "Verifiquei que", ...):
+// por isso o texto de cada sessão é reconstruído do zero a cada evento, mantendo só a versão mais longa,
+// e a sessão é curta (continuous=false) e reiniciada automaticamente enquanto o ditado estiver ativo.
+const SRec=window.SpeechRecognition||window.webkitSpeechRecognition;
+const IS_ANDROID=/Android/i.test(navigator.userAgent);
+let dict=null, dictOn=false, dictBase="", dictSess="";
+const normW=s=>noAcc(String(s||"").toLowerCase()).replace(/[^a-z0-9 ]/g,"").replace(/\s+/g," ").trim();
+function joinUnique(parts){
+  const out=[];
+  for(const raw of parts){ const s=raw.trim(); if(!s) continue;
+    const n=normW(s); if(!n) continue;
+    const last=out.length?normW(out[out.length-1]):"";
+    if(last && n.startsWith(last)) out[out.length-1]=s;          // versão ampliada do mesmo trecho
+    else if(last && last.startsWith(n)) continue;                 // repetição menor
+    else if(last===n) continue;
+    else out.push(s);
+  }
+  return out;
+}
+function frase(s){ s=s.trim(); return s?cap(s)+(/[.!?]$/.test(s)?"":"."):""; }
+function dictRender(interim){
+  const ta=$("#transcricao");
+  ta.value=(dictBase+(dictSess?dictSess+" ":"")+(interim||"")).replace(/\s+$/," ");
+}
+function dictStartSession(){
+  dict=new SRec(); dict.lang="pt-BR"; dict.continuous=!IS_ANDROID; dict.interimResults=true; dict.maxAlternatives=1;
+  dictSess="";
+  dict.onresult=e=>{
+    const finals=[]; let interim="";
+    for(let i=0;i<e.results.length;i++){ const tx=e.results[i][0].transcript; if(e.results[i].isFinal) finals.push(tx); else interim=tx; }
+    let parts=joinUnique(finals);
+    if(interim){ const ni=normW(interim), nl=parts.length?normW(parts[parts.length-1]):""; if(nl && ni.startsWith(nl)) parts.pop(); else if(nl && nl.startsWith(ni)) interim=""; }
+    dictSess=parts.map(frase).join(" ");
+    dictRender(interim.trim()); save();
+  };
+  dict.onerror=e=>{ if(e.error==="no-speech"||e.error==="aborted") return; toast("Ditado: "+e.error+(e.error==="network"?" (o ditado ao vivo precisa de internet — use “Gravar áudio” offline)":"")); if(e.error==="not-allowed"||e.error==="network") dictOn=false; };
+  dict.onend=()=>{
+    if(dictSess){ dictBase+=dictSess+" "; dictSess=""; }
+    dictRender("");
+    if(dictOn){ try{ dictStartSession(); return; }catch(err){} }
+    dict=null; dictOn=false; $("#btnDictate").textContent="🎙 Ditado ao vivo"; $("#btnDictate").classList.remove("rec","on");
+    $("#transcricao").value=$("#transcricao").value.trim(); save(); onTranscriptChanged();
+  };
+  dict.start();
+}
 $("#btnDictate").onclick=()=>{
   if(!SRec) return toast("Ditado ao vivo não é suportado neste navegador. Use “Gravar áudio”.");
-  if(dict){ dict.stop(); return; }
-  dict=new SRec(); dict.lang="pt-BR"; dict.continuous=true; dict.interimResults=true;
-  const ta=$("#transcricao"); let base=ta.value; if(base && !/\s$/.test(base)) base+=" ";
-  dict.onresult=e=>{ let interim=""; for(let i=e.resultIndex;i<e.results.length;i++){ const t=e.results[i][0].transcript.trim(); if(e.results[i].isFinal){ base+=cap(t)+". "; } else interim+=t; } ta.value=base+interim; save(); };
-  dict.onerror=e=>toast("Ditado: "+e.error);
-  dict.onend=()=>{ dict=null; $("#btnDictate").textContent="🎙 Ditado ao vivo"; $("#btnDictate").classList.remove("rec","on"); onTranscriptChanged(); };
-  dict.start(); $("#btnDictate").textContent="■ Parar ditado"; $("#btnDictate").classList.add("rec","on");
+  if(dictOn){ dictOn=false; try{ dict&&dict.stop(); }catch(e){} return; }
+  const ta=$("#transcricao"); dictBase=ta.value.trim(); if(dictBase) dictBase+=" ";
+  dictOn=true; dictStartSession(); $("#btnDictate").textContent="■ Parar ditado"; $("#btnDictate").classList.add("rec","on");
 };
 let trT=null;
 $("#transcricao").addEventListener("input",()=>{ clearTimeout(trT); trT=setTimeout(()=>onTranscriptChanged(true),2500); });
@@ -1005,7 +1053,7 @@ function analyzePhotos(list,opt={}){
           setBusy(p,"Analisando imagem…"); setStatus("IA analisando imagem "+n+" de "+list.length+"…", n/list.length*100);
           p.visual=await describeVisual(p.data);
         }
-      }catch(err){ console.error(err); p.visual=p.visual||""; toast("Falha na análise da imagem: "+(err.message||err),6000); }
+      }catch(err){ idle(); console.error(err); p.visual=p.visual||""; toast("Falha na análise da imagem: "+(err.message||err),6000); }
       p.busy=null; renderPhotos();
     }
     hideStatus();
@@ -1046,11 +1094,13 @@ async function tf(){
   try{ TF=await import(TF_URL); }
   catch(e){ hideStatus(); throw new Error("não foi possível carregar o motor de IA (primeiro uso exige internet)"); }
   TF.env.allowLocalModels=false; TF.env.useBrowserCache=true;
+  try{ if(MOBILE) TF.env.backends.onnx.wasm.numThreads=2; }catch(e){}
   return TF;
 }
 async function device(){
   if(DEVICE) return DEVICE;
   if(CFG.device!=="auto") return DEVICE=CFG.device;
+  if(MOBILE) return DEVICE="wasm";
   try{ if(navigator.gpu){ const a=await navigator.gpu.requestAdapter(); if(a) return DEVICE="webgpu"; } }catch(e){}
   return DEVICE="wasm";
 }
@@ -1064,33 +1114,51 @@ function prog(label){
   };
 }
 async function tryDtypes(fn,list){ let last; for(const d of list){ try{ return await fn(d); }catch(e){ last=e; console.warn("Configuração falhou:",d,e); } } throw last; }
+async function liberar(keep){
+  if(!MOBILE) return;
+  for(const k of ["asr","vis","llm"]){ if(k===keep||!M[k]) continue;
+    try{ const m=k==="vis"?M.vis.model:M[k]; if(m&&m.dispose) await m.dispose(); }catch(e){}
+    delete M[k]; if(k==="llm") llmTried=false; }
+  badge();
+}
+function busy(k){ LS.set("aiBusy",k); }
+function idle(){ LS.del("aiBusy"); }
 async function getASR(){
-  if(M.asr) return M.asr; const T=await tf(); const dev=await device();
+  if(M.asr) return M.asr; await liberar("asr"); const T=await tf(); const dev=await device();
   const list = dev==="webgpu" ? [{encoder_model:"fp32",decoder_model_merged:"q4"},"fp32"] : ["q8","fp32"];
   M.asr=await tryDtypes(d=>T.pipeline("automatic-speech-recognition",CFG.asr,{device:dev,dtype:d,progress_callback:prog("Whisper (áudio → texto)")}),list);
   badge(); return M.asr;
 }
 async function getVision(){
-  if(M.vis) return M.vis; const T=await tf(); const dev=await device();
+  if(M.vis) return M.vis; await liberar("vis"); const T=await tf(); const dev=await device();
   const list = dev==="webgpu" ? [{embed_tokens:"fp16",vision_encoder:"fp16",encoder_model:"q4",decoder_model_merged:"q4"},"fp32"]
-                              : [{embed_tokens:"fp32",vision_encoder:"fp32",encoder_model:"q8",decoder_model_merged:"q8"},"fp32"];
+             : MOBILE ? [{embed_tokens:"q8",vision_encoder:"q8",encoder_model:"q8",decoder_model_merged:"q8"},"q8"]
+                      : [{embed_tokens:"fp32",vision_encoder:"fp32",encoder_model:"q8",decoder_model_merged:"q8"},"fp32"];
   const model=await tryDtypes(d=>T.Florence2ForConditionalGeneration.from_pretrained(CFG.vision,{device:dev,dtype:d,progress_callback:prog("Florence-2 (análise de imagem)")}),list);
   const processor=await T.AutoProcessor.from_pretrained(CFG.vision);
   M.vis={model,processor}; badge(); return M.vis;
 }
 async function describeVisual(dataURL){
+  busy("vis");
   const {model,processor}=await getVision();
-  const blob=await (await fetch(dataURL)).blob(); const image=await TF.RawImage.fromBlob(blob);
+  const blob=await (await fetch(await reduzir(dataURL,768))).blob(); const image=await TF.RawImage.fromBlob(blob);
   const task="<MORE_DETAILED_CAPTION>"; const prompts=processor.construct_prompts(task);
   const inputs=await processor(image,prompts);
   const ids=await model.generate({...inputs,max_new_tokens:110});
   const txt=processor.batch_decode(ids,{skip_special_tokens:false})[0];
   const r=processor.post_process_generation(txt,task,image.size);
+  idle();
   return String(r[task]||"").replace(/<\/?s>|<pad>/g,"").trim();
+}
+async function reduzir(dataURL,max){
+  const im=await new Promise((res,rej)=>{ const i=new Image(); i.onload=()=>res(i); i.onerror=rej; i.src=dataURL; });
+  const k=Math.min(1,max/Math.max(im.width,im.height)); if(k>=1) return dataURL;
+  const c=document.createElement("canvas"); c.width=Math.round(im.width*k); c.height=Math.round(im.height*k);
+  c.getContext("2d").drawImage(im,0,0,c.width,c.height); return c.toDataURL("image/jpeg",0.85);
 }
 function llmReady(){ return !!M.llm || !llmTried; }
 async function getLLM(){
-  if(M.llm) return M.llm; llmTried=true; const T=await tf(); const dev=await device();
+  if(M.llm) return M.llm; llmTried=true; await liberar("llm"); const T=await tf(); const dev=await device();
   const list = dev==="webgpu" ? ["q4f16","q4"] : ["q4","q8"];
   M.llm=await tryDtypes(d=>T.pipeline("text-generation",CFG.llm,{device:dev,dtype:d,progress_callback:prog("Qwen 2.5 (redação)")}),list);
   badge(); hideStatus(); return M.llm;
@@ -1098,7 +1166,7 @@ async function getLLM(){
 const PERSONA="Você é engenheiro civil fiscal de obras do Tribunal de Justiça do Estado do Paraná (TJPR). Escreve relatórios de vistoria de serviços de engenharia (instalação de ar-condicionado, reformas, demolições, construção, reparos, manutenção e projetos) em português do Brasil, com linguagem técnica, formal e impessoal (ex.: “Constatou-se”, “Verificou-se”). Usa apenas as informações fornecidas e nunca inventa medidas, quantidades, marcas ou serviços.";
 async function llm(user,max=300){
   const g=await getLLM();
-  const out=await g([{role:"system",content:PERSONA},{role:"user",content:user}],{max_new_tokens:max,do_sample:false,repetition_penalty:1.08});
+  busy("llm"); const out=await g([{role:"system",content:PERSONA},{role:"user",content:user}],{max_new_tokens:max,do_sample:false,repetition_penalty:1.08}); idle();
   const m=out[0].generated_text; return (Array.isArray(m)?m[m.length-1].content:String(m)).trim();
 }
 async function llmCaption(i,visual,ctx){
@@ -1338,6 +1406,8 @@ $("#btnPreload").onclick=()=>queue(async()=>{
 /* ====================== INÍCIO ====================== */
 $("#seiUnid").value=LS.get("seiUnid","DOR")||"DOR";
 renderEngs(); renderComarcas(); renderCfg(); renderUnidades(); renderExp(); restore(); renderAudios(); badge();
+if(AI_CRASH){ const nome={vis:"análise automática de imagens",llm:"redação por IA (LLM)",asr:"transcrição automática"}[AI_CRASH]||"IA";
+  setTimeout(()=>toast("O navegador fechou durante a "+nome+" (falta de memória). Ela foi desativada automaticamente neste aparelho — pode reativar em ⚙ Configurações da IA.",9000),800); }
 </script>
 </body>
 </html>
